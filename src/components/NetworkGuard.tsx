@@ -1,3 +1,15 @@
+/**
+ * 🛡️ Sepolia 네트워크 가드
+ * 
+ * 역할:
+ * - 현재 네트워크가 Sepolia(11155111)인지 확인
+ * - 아니면 자동으로 전환 요청
+ * - 콘솔에 ChainID 로그 출력
+ * - 비-Sepolia 시 배너 표시
+ * 
+ * layout.tsx에서 전역으로 사용
+ */
+
 'use client'
 
 import { useEffect, useState } from 'react'
@@ -12,19 +24,25 @@ export default function NetworkGuard() {
   const [autoTried, setAutoTried] = useState(false)
 
   useEffect(() => {
-    let canceled = false
+    const canceled = false
     async function ensureSepolia() {
       if (!window.ethereum) {
         setIsSepolia(null)
         return
       }
-      const onChainChanged = (id: string) => {
-        const dec = parseInt(id, 16)
+      
+      // chainChanged 이벤트 핸들러 (chainId는 string 타입)
+      // chainChanged 이벤트 핸들러
+      const handleChainChanged = (chainIdHex: unknown) => {
+        const dec = parseInt(String(chainIdHex), 16)
         console.log('CHAIN_ID =', dec)
         setIsSepolia(dec === SEPOLIA_CHAIN_ID)
       }
-      // 타입 정의가 accountsChanged 시그니처로 되어 있어 캐스팅
-      ;(window.ethereum as any).on?.('chainChanged', onChainChanged)
+      
+      // chainChanged 이벤트 리스너 등록
+      if (window.ethereum.on) {
+        window.ethereum.on('chainChanged', handleChainChanged)
+      }
 
       try {
         // 현재 체인 읽고 로그 출력
@@ -53,10 +71,9 @@ export default function NetworkGuard() {
       }
 
       return () => {
-        ;(window.ethereum as any)?.removeListener?.(
-          'chainChanged',
-          onChainChanged
-        )
+        if (window.ethereum?.removeListener) {
+          window.ethereum.removeListener('chainChanged', handleChainChanged)
+        }
       }
     }
     ensureSepolia()

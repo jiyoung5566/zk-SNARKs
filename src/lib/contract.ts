@@ -1,10 +1,34 @@
+/**
+ * 🌐 Web3 & 스마트 컨트랙트 연동 핵심 로직
+ *
+ * 역할:
+ * - Sepolia 테스트넷 연동
+ * - RPC 폴백 (Alchemy → Infura → 공용)
+ * - 가스 자동 추정 + 20% 버퍼
+ * - 투표 트랜잭션 전송
+ *
+ * 주요 함수:
+ * - getRpcProvider() - RPC 자동 폴백
+ * - getVotingContract() - 쓰기 가능 컨트랙트
+ * - submitVote() - 투표 제출 (가스 추정 포함)
+ * - switchToSepolia() - 네트워크 전환
+ */
+
 import { ethers } from 'ethers'
 
 // Sepolia 네트워크 체인 ID
 export const SEPOLIA_CHAIN_ID = 11155111
 
-// RPC 엔드포인트 (폴백 순서: Alchemy → Infura → 공용 RPC)
-// 환경 변수에서 API 키를 가져오거나, 없으면 공용 RPC 사용
+/**
+ * RPC 엔드포인트 목록 생성
+ *
+ * 폴백 전략:
+ * 1순위: Alchemy (API 키 있으면)
+ * 2순위: Infura (API 키 있으면)
+ * 3순위: 공용 RPC (무료, 제한 있음)
+ *
+ * → 하나씩 시도해서 작동하는 것 사용
+ */
 const getRpcEndpoints = (): string[] => {
   const alchemyKey = process.env.NEXT_PUBLIC_ALCHEMY_API_KEY
   const infuraKey = process.env.NEXT_PUBLIC_INFURA_API_KEY
@@ -38,20 +62,27 @@ const getRpcEndpoints = (): string[] => {
 const RPC_ENDPOINTS = getRpcEndpoints()
 
 /**
- * RPC 엔드포인트가 작동하는지 테스트
+ * RPC 엔드포인트 테스트
+ *
+ * 체크 항목:
+ * 1. 블록 번호 조회 가능한지
+ * 2. 체인 ID가 Sepolia(11155111)인지
+ *
+ * @returns true면 사용 가능, false면 다음 RPC 시도
  */
 async function testRpcEndpoint(url: string): Promise<boolean> {
   try {
     const provider = new ethers.JsonRpcProvider(url)
     const blockNumber = await provider.getBlockNumber()
-    const chainId = await provider.getChainId()
-    
+    const network = await provider.getNetwork()
+    const chainId = Number(network.chainId)
+
     // Sepolia 체인 ID 확인
     if (chainId !== SEPOLIA_CHAIN_ID) {
       console.warn(`RPC ${url}: 잘못된 체인 ID (${chainId})`)
       return false
     }
-    
+
     console.log(`✅ RPC 작동 확인: ${url} (블록: ${blockNumber})`)
     return true
   } catch (error) {
@@ -61,7 +92,14 @@ async function testRpcEndpoint(url: string): Promise<boolean> {
 }
 
 /**
- * 작동하는 RPC Provider 찾기 (폴백 로직)
+ * 작동하는 RPC Provider 찾기 (폴백 + 캐싱)
+ *
+ * 동작 방식:
+ * 1. 캐시된 Provider가 있으면 재사용
+ * 2. 없거나 죽었으면 순차적으로 테스트
+ * 3. 첫 번째 작동하는 RPC를 캐시
+ *
+ * @throws 모든 RPC 실패 시 에러
  */
 let cachedProvider: ethers.JsonRpcProvider | null = null
 let cachedProviderUrl: string | null = null
@@ -245,9 +283,10 @@ export async function switchToSepolia(): Promise<boolean> {
       params: [{ chainId: `0x${SEPOLIA_CHAIN_ID.toString(16)}` }],
     })
     return true
-  } catch (switchError: any) {
+  } catch (switchError: unknown) {
+    const error = switchError as { code?: number; message?: string }
     // 네트워크가 추가되지 않은 경우
-    if (switchError.code === 4902) {
+    if (error.code === 4902) {
       try {
         await window.ethereum.request({
           method: 'wallet_addEthereumChain',
@@ -294,7 +333,7 @@ export async function isSepoliaNetwork(): Promise<boolean> {
 }
 
 /**
- * Voting 컨트랙트 인스턴스 가져오기
+ * Voting 컨트랙트 인스턴스 가져오기 (쓰기 가능 - Signer 포함)
  */
 export async function getVotingContract() {
   if (!window.ethereum) {
@@ -322,9 +361,30 @@ export async function getVotingContract() {
 }
 
 /**
- * ZKP Proof를 사용하여 투표하기
- * @param option 투표 옵션 (0 또는 1)
- * @param proof ZKP 증명 데이터
+ * Voting 컨트랙트 인스턴스 가져오기 (읽기 전용 - RPC Provider 사용)
+ */
+export async function getVotingContractReadOnly() {
+  const provider = await getRpcProvider()
+  const contract = new ethers.Contract(
+    CONTRACT_ADDRESSES.Voting,
+    VOTING_ABI,
+    provider
+  )
+  return contract
+}
+
+/**
+ * 투표 트랜잭션 전송 (가스 추정 + 재시도)
+ *
+ * 흐름:
+ * 1. 가스 추정 (estimateGas)
+ * 2. 20% 버퍼 추가
+ * 3. 트랜잭션 전송
+ * 4. 확인 대기 (최대 5분)
+ *
+ * @param proposalId 제안 ID
+ * @param payload { proofBytes, pubSignals }
+ * @returns { txHash, receipt }
  */
 export async function submitVote(
   proposalId: number,
@@ -346,22 +406,19 @@ export async function submitVote(
         payload.pubSignals
       )
       console.log('추정된 가스:', estimatedGas.toString())
-    } catch (estimateError: any) {
-      console.error('가스 추정 실패:', estimateError)
+    } catch (estimateError: unknown) {
+      const error = estimateError as { message?: string; reason?: string }
+      console.error('가스 추정 실패:', error)
 
       // 가스 추정 실패 원인 분석
-      if (estimateError.message?.includes('insufficient funds')) {
+      if (error.message?.includes('insufficient funds')) {
         throw new Error(
           '가스비가 부족합니다. 지갑에 Sepolia ETH를 충전해주세요.'
         )
-      } else if (
-        estimateError.message?.includes('revert') ||
-        estimateError.reason
-      ) {
+      } else if (error.message?.includes('revert') || error.reason) {
         throw new Error(
           `트랜잭션 실행 불가: ${
-            estimateError.reason ||
-            '컨트랙트 실행 실패 (이미 투표했거나 잘못된 입력)'
+            error.reason || '컨트랙트 실행 실패 (이미 투표했거나 잘못된 입력)'
           }`
         )
       } else {
@@ -386,18 +443,19 @@ export async function submitVote(
           gasLimit: gasWithBuffer,
         }
       )
-    } catch (sendError: any) {
-      console.error('트랜잭션 전송 실패:', sendError)
+    } catch (sendError: unknown) {
+      const error = sendError as { code?: string; message?: string }
+      console.error('트랜잭션 전송 실패:', error)
 
-      if (sendError.code === 'ACTION_REJECTED') {
+      if (error.code === 'ACTION_REJECTED') {
         throw new Error('트랜잭션이 거부되었습니다.')
-      } else if (sendError.message?.includes('insufficient funds')) {
+      } else if (error.message?.includes('insufficient funds')) {
         throw new Error(
           '가스비가 부족합니다. 지갑에 Sepolia ETH를 충전해주세요.'
         )
       } else {
         throw new Error(
-          `트랜잭션 전송 실패: ${sendError.message || '알 수 없는 오류'}`
+          `트랜잭션 전송 실패: ${error.message || '알 수 없는 오류'}`
         )
       }
     }
@@ -424,22 +482,23 @@ export async function submitVote(
       })
 
       receipt = await Promise.race([tx.wait(), timeoutPromise])
-    } catch (waitError: any) {
-      console.error('트랜잭션 대기 실패:', waitError)
+    } catch (waitError: unknown) {
+      const error = waitError as { message?: string }
+      console.error('트랜잭션 대기 실패:', error)
 
       // 타임아웃인 경우 트랜잭션 해시는 있으므로 반환
-      if (waitError.message?.includes('시간이 초과')) {
+      if (error.message?.includes('시간이 초과')) {
         throw new Error(
-          `${waitError.message}\n트랜잭션 해시: ${tx.hash}\nEtherscan에서 확인: https://sepolia.etherscan.io/tx/${tx.hash}`
+          `${error.message}\n트랜잭션 해시: ${tx.hash}\nEtherscan에서 확인: https://sepolia.etherscan.io/tx/${tx.hash}`
         )
       } else if (
-        waitError.message?.includes('replacement transaction underpriced')
+        error.message?.includes('replacement transaction underpriced')
       ) {
         throw new Error('네트워크가 혼잡합니다. 잠시 후 다시 시도해주세요.')
       } else {
         throw new Error(
           `트랜잭션 확인 실패: ${
-            waitError.message || '네트워크 오류가 발생했습니다.'
+            error.message || '네트워크 오류가 발생했습니다.'
           }`
         )
       }
@@ -464,23 +523,24 @@ export async function submitVote(
       txHash: tx.hash,
       receipt: receipt!,
     }
-  } catch (error: any) {
-    console.error('투표 트랜잭션 실패:', error)
+  } catch (error: unknown) {
+    const err = error as { code?: string; message?: string; reason?: string }
+    console.error('투표 트랜잭션 실패:', err)
 
     // 이미 처리된 에러는 그대로 throw
-    if (error.message && !error.message.includes('트랜잭션 실패')) {
+    if (err.message && !err.message.includes('트랜잭션 실패')) {
       throw error
     }
 
     // 사용자 친화적인 에러 메시지
-    if (error.code === 'ACTION_REJECTED') {
+    if (err.code === 'ACTION_REJECTED') {
       throw new Error('트랜잭션이 거부되었습니다.')
-    } else if (error.reason) {
-      throw new Error(`트랜잭션 실패: ${error.reason}`)
-    } else if (error.message) {
+    } else if (err.reason) {
+      throw new Error(`트랜잭션 실패: ${err.reason}`)
+    } else if (err.message) {
       throw error // 이미 처리된 에러 메시지
     } else {
-      throw new Error(`트랜잭션 실패: ${error.message || '알 수 없는 오류'}`)
+      throw new Error(`트랜잭션 실패: ${err.message || '알 수 없는 오류'}`)
     }
   }
 }
@@ -494,24 +554,24 @@ export async function getProposal(
   try {
     const contract = await getVotingContractReadOnly()
     return await contract.getProposal(proposalId)
-  } catch (error: any) {
-    console.error('제안 조회 실패:', error)
-    throw new Error(`제안 조회 실패: ${error.message || '알 수 없는 오류'}`)
+  } catch (error: unknown) {
+    const err = error as { message?: string }
+    console.error('제안 조회 실패:', err)
+    throw new Error(`제안 조회 실패: ${err.message || '알 수 없는 오류'}`)
   }
 }
 
 /**
  * nullifier 해시가 사용되었는지 확인 (읽기 전용 - RPC 폴백 사용)
  */
-export async function isNullifierUsed(
-  nullifierHash: string
-): Promise<boolean> {
+export async function isNullifierUsed(nullifierHash: string): Promise<boolean> {
   try {
     const contract = await getVotingContractReadOnly()
     return await contract.isUsed(nullifierHash)
-  } catch (error: any) {
-    console.error('nullifier 확인 실패:', error)
-    throw new Error(`nullifier 확인 실패: ${error.message || '알 수 없는 오류'}`)
+  } catch (error: unknown) {
+    const err = error as { message?: string }
+    console.error('nullifier 확인 실패:', err)
+    throw new Error(`nullifier 확인 실패: ${err.message || '알 수 없는 오류'}`)
   }
 }
 
@@ -528,9 +588,10 @@ export async function hasVoted(address: string): Promise<boolean> {
     }
     // 없으면 false 반환 (nullifier 해시로 확인해야 함)
     return false
-  } catch (error: any) {
-    console.error('투표 여부 확인 실패:', error)
+  } catch (error: unknown) {
+    const err = error as { message?: string }
+    console.error('투표 여부 확인 실패:', err)
     // 에러가 나도 false 반환 (에러를 숨기지 않음)
-    throw new Error(`투표 여부 확인 실패: ${error.message || '알 수 없는 오류'}`)
+    throw new Error(`투표 여부 확인 실패: ${err.message || '알 수 없는 오류'}`)
   }
 }

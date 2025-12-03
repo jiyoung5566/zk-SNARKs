@@ -29,8 +29,10 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
-        <NetworkGuard />
-        <WalletProvider>{children}</WalletProvider>
+        <WalletProvider>
+          <NetworkGuard />
+          {children}
+        </WalletProvider>
       </body>
     </html>
   )

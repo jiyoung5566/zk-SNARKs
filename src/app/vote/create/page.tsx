@@ -46,7 +46,7 @@ export default function CreateVotePage() {
     try {
       // localStorage에 투표 저장
       const { addVote } = await import('@/lib/voteStorage')
-      const newVote = addVote({
+      addVote({
         title: title.trim(),
         description: description.trim(),
         options: validOptions,

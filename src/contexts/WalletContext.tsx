@@ -10,6 +10,7 @@ import {
 
 interface WalletContextType {
   account: string | null
+  address: string | null
   connectWallet: () => Promise<void>
   isConnected: boolean
 }
@@ -24,7 +25,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     if (typeof window !== 'undefined' && window.ethereum) {
       window.ethereum
         .request({ method: 'eth_accounts' })
-        .then((accounts: string[]) => {
+        .then((result: unknown) => {
+          const accounts = result as string[]
           if (accounts.length > 0) {
             setAccount(accounts[0])
           }
@@ -32,9 +34,12 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         .catch(console.error)
 
       // 지갑 계정 변경 감지
-      window.ethereum.on('accountsChanged', (accounts: string[]) => {
+      const handleAccountsChanged = (data: unknown) => {
+        const accounts = data as string[]
         setAccount(accounts.length > 0 ? accounts[0] : null)
-      })
+      }
+      
+      window.ethereum.on('accountsChanged', handleAccountsChanged)
     }
   }, [])
 
@@ -45,9 +50,10 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
 
     try {
-      const accounts = await window.ethereum.request({
+      const result = await window.ethereum.request({
         method: 'eth_requestAccounts',
       })
+      const accounts = result as string[]
       setAccount(accounts[0])
     } catch (error) {
       console.error(error)
@@ -58,6 +64,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     <WalletContext.Provider
       value={{
         account,
+        address: account,
         connectWallet,
         isConnected: !!account,
       }}
