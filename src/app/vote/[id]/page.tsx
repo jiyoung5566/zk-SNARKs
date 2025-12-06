@@ -5,7 +5,7 @@ import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { getVoteById, type Vote } from '@/lib/voteStorage'
 import { useWallet } from '@/contexts/WalletContext'
-import { ensureRegistered } from '@/lib/voter'
+import { ensureRegistered } from '@/lib/user'
 import ConnectWalletButton from '@/components/ConnectWalletButton'
 import StatusBadge from '@/components/StatusBadge'
 import RelayerToggle from '@/components/RelayerToggle'
@@ -53,13 +53,66 @@ export default function VoteDetailPage() {
     setVote(v)
   }, [pollId, router])
 
-  /** 투표 버튼 눌렀을 때 전체 흐름 */
+  /** Proof 생성: WebWorker → 서버 fallback */
+  const generateProof = async (input: unknown) => {
+    if (proofWorker) {
+      try {
+        const proof = await new Promise<{
+          ok: boolean
+          proof: string
+          publicSignals: any
+          error?: string
+        }>((resolve, reject) => {
+          proofWorker.onmessage = (event) => {
+            const data = event.data
+            if (data.ok) return resolve(data)
+            reject(new Error(data.error))
+          }
+
+          proofWorker.postMessage({
+            input,
+            wasmPath: '/build/v1.2/vote_js/vote.wasm',
+            zkeyPath: '/build/v1.2/vote_final.zkey',
+          })
+        })
+        console.log('[VoteDetail] WebWorker proof OK')
+        return proof
+      } catch (err) {
+        console.warn(
+          '[VoteDetail] WebWorker proof failed, fallback to server:',
+          err
+        )
+      }
+    }
+
+    // 서버 fallback
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL
+      const res = await fetch(`${apiUrl}/api/proof/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input }),
+      })
+      if (!res.ok) {
+        const text = await res.text().catch(() => '')
+        throw new Error(`Server proof failed: ${res.status} ${text}`)
+      }
+
+      const json = await res.json()
+      console.log('[VoteDetail] Server proof OK', json)
+      return json
+    } catch (err) {
+      console.error('[VoteDetail] Proof generation failed:', err)
+      throw new Error('ZKP 생성 실패')
+    }
+  }
+
+  /** 투표 버튼 클릭 */
   const handleVoteClick = async () => {
     if (!isConnected || !address) {
       alert('지갑을 먼저 연결해주세요.')
       return
     }
-
     if (!selectedOption) {
       alert('선택지를 선택해주세요!')
       return
@@ -70,42 +123,23 @@ export default function VoteDetailPage() {
       setStatus('registering')
       setStatusMessage('투표자 등록 중...')
 
-      // ① 투표자 등록 / identity 확보
+      // ① 투표자 등록
       const identity = await ensureRegistered(address)
-
       const { identityNullifier, identityTrapdoor } = identity
 
-      // ② poll merkle 정보 불러오기
+      // ② poll 공개 정보 가져오기
       setStatus('connecting')
       setStatusMessage('Merkle proof 불러오는 중...')
 
-      const apiUrl =
-        process.env.NEXT_PUBLIC_API_URL ||
-        'https://my-anon-voting-platfrom2.onrender.com'
-
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL
       const pollUrl = `${apiUrl}/api/polls/${pollId}/public`
+
       console.log('[VoteDetail] poll fetch URL:', pollUrl)
-
-      let pollRes: Response
-      try {
-        pollRes = await fetch(pollUrl, {
-          method: 'GET',
-        })
-      } catch (e) {
-        console.error('[VoteDetail] poll fetch network error:', e)
-        throw new Error('투표 정보를 불러오는 중 네트워크 오류가 발생했습니다.')
-      }
-
+      const pollRes = await fetch(pollUrl)
       if (!pollRes.ok) {
         const text = await pollRes.text().catch(() => '')
-        console.error(
-          '[VoteDetail] poll fetch failed:',
-          pollRes.status,
-          pollRes.statusText,
-          text
-        )
         throw new Error(
-          `투표 정보를 불러오지 못했습니다. (status ${pollRes.status})`
+          `투표 정보를 불러오지 못했습니다. (status ${pollRes.status}) ${text}`
         )
       }
 
@@ -113,11 +147,11 @@ export default function VoteDetailPage() {
       const { root, merkleProof } = pollJson
       const { pathElements, pathIndices } = merkleProof
 
-      // ③ vote 값 인덱스 변환
+      // ③ 선택지 인덱스
       const optionIndex =
         vote?.options.findIndex((o) => o === selectedOption) ?? 0
 
-      // ④ Worker용 input 구성
+      // ④ Worker input 구성 (v1.2 format)
       const input = {
         pollId,
         vote: optionIndex,
@@ -130,124 +164,63 @@ export default function VoteDetailPage() {
         },
       }
 
-      // ⑤ Worker에서 ZKP 생성 요청
+      // ⑤ ZKP 생성
       setStatus('generating-proof')
-      setStatusMessage('ZKP 증명 생성 중... (3~6초)')
-      const proof = await generateProofInWorker(input)
-
+      setStatusMessage('ZKP 증명 생성 중... (WebWorker 혹은 서버)')
+      const proof = await generateProof(input)
       const { proof: proofJsonStr, publicSignals } = proof
 
-      // ⑥ relayer로 투표 트랜잭션 보내기
+      // ⑥ publicSignals 순서 재정렬 (v1.2 docs 기준)
+      const reorderedPublicSignals = [
+        publicSignals.root,
+        publicSignals.pollId,
+        publicSignals.nullifier,
+        publicSignals.voteCommitment,
+      ]
+
+      // ⑦ Relayer 전송
       setStatus('submitting')
       setStatusMessage('블록체인에 투표 전송 중...')
 
-      if (relayerEnabled) {
-        const relayerUrl =
-          process.env.NEXT_PUBLIC_RELAYER_URL ||
-          'https://my-anon-voting-platfrom2.onrender.com/api/relayer'
+      if (!relayerEnabled) throw new Error('직접 전송 기능 미구현')
 
-        const sendUrl = `${relayerUrl}/send`
-        console.log('[VoteDetail] relayer URL:', sendUrl)
+      const relayerUrl =
+        process.env.NEXT_PUBLIC_RELAYER_URL || `${apiUrl}/api/relayer/send`
+      const relayerRes = await fetch(relayerUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pollId,
+          proof: proofJsonStr,
+          publicSignals: reorderedPublicSignals,
+        }),
+      })
 
-        let relayerRes: Response
-        try {
-          relayerRes = await fetch(sendUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              pollId,
-              proof: proofJsonStr,
-              publicSignals,
-            }),
-          })
-        } catch (e) {
-          console.error('[VoteDetail] relayer network error:', e)
-          throw new Error('Relayer로 전송 중 네트워크 오류가 발생했습니다.')
-        }
-
-        if (!relayerRes.ok) {
-          const text = await relayerRes.text().catch(() => '')
-          console.error(
-            '[VoteDetail] relayer failed:',
-            relayerRes.status,
-            relayerRes.statusText,
-            text
-          )
-          throw new Error(
-            `Relayer 오류가 발생했습니다. (status ${relayerRes.status})`
-          )
-        }
-
-        const relayerJson = await relayerRes.json()
-        console.log('[VoteDetail] relayer response:', relayerJson)
-
-        if (!relayerJson.ok) {
-          throw new Error(relayerJson.error || 'Relayer 오류')
-        }
-
-        setTxHash(relayerJson.txHash)
-        setStatus('confirming')
-        setStatusMessage('트랜잭션 확인 중 (최대 2회)')
-
-        setTimeout(() => {
-          setStatus('confirmed')
-          setStatusMessage(`"${selectedOption}" 투표 완료!`)
-        }, 3000)
-      } else {
-        setStatus('error')
-        setStatusMessage('직접 전송 기능은 아직 구현되지 않았습니다.')
-        throw new Error('직접 전송 기능은 아직 구현되지 않았습니다.')
+      if (!relayerRes.ok) {
+        const text = await relayerRes.text().catch(() => '')
+        throw new Error(`Relayer 오류: ${relayerRes.status} ${text}`)
       }
+
+      const relayerJson = await relayerRes.json()
+      if (!relayerJson.ok) throw new Error(relayerJson.error || 'Relayer 오류')
+
+      setTxHash(relayerJson.txHash)
+      setStatus('confirming')
+      setStatusMessage('트랜잭션 확인 중 (최대 2회)')
+
+      setTimeout(() => {
+        setStatus('confirmed')
+        setStatusMessage(`"${selectedOption}" 투표 완료!`)
+      }, 3000)
     } catch (err: unknown) {
       const error = err as { message?: string }
       console.error('[VoteDetail] handleVoteClick error:', error)
-
-      if (
-        error.message?.includes('중복') ||
-        error.message?.includes('duplicate')
-      ) {
-        setStatus('duplicate')
-        setStatusMessage('이미 투표하셨습니다.')
-      } else {
-        setStatus('error')
-        setStatusMessage(error.message || '알 수 없는 오류')
-      }
-
+      setStatus('error')
+      setStatusMessage(error.message || '알 수 없는 오류')
       alert(`투표 실패: ${error.message}`)
     } finally {
       setLoading(false)
     }
-  }
-
-  /** Worker에서 ZKP 생성 (Promise 래핑) */
-  const generateProofInWorker = (input: unknown) => {
-    return new Promise<{
-      ok: boolean
-      proof: string
-      publicSignals: unknown
-      error?: string
-    }>((resolve, reject) => {
-      if (!proofWorker) return reject(new Error('Worker 초기화 실패'))
-
-      proofWorker.onmessage = (
-        event: MessageEvent<{
-          ok: boolean
-          proof: string
-          publicSignals: unknown
-          error?: string
-        }>
-      ) => {
-        const data = event.data
-        if (data.ok) return resolve(data)
-        reject(new Error(data.error))
-      }
-
-      proofWorker.postMessage({
-        input,
-        wasmPath: '/zkp/build/v1.2/vote.wasm',
-        zkeyPath: '/zkp/build/v1.2/vote_final.zkey',
-      })
-    })
   }
 
   if (!vote) return <p>로딩...</p>
